@@ -1,0 +1,1756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Asteroids — Neon Wireframe</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; }
+  body {
+    background: #04060c;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: ui-monospace, "Courier New", Menlo, Consolas, monospace;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  main { display: block; }
+  #game {
+    display: block;
+    background: #04060c;
+    cursor: crosshair;
+    outline: none;
+  }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="game" width="960" height="600" role="img"
+          aria-label="Asteroids — neon wireframe space shooter"></canvas>
+</main>
+
+<script>
+(() => {
+"use strict";
+
+/* ================================================================
+ *  CONSTANTS & TUNING TABLE
+ * ================================================================ */
+const STATE = Object.freeze({
+  MENU: "MENU",
+  PLAYING: "PLAYING",
+  GAME_OVER: "GAME_OVER"
+});
+
+const CONFIG = Object.freeze({
+  startLives: 3,
+  ship: {
+    radius: 12,          // collision radius (px)
+    rotateSpeed: 3.8,    // rad / s
+    thrust: 1400,        // px / s^2
+    drag: 0.4,           // exponential velocity decay coefficient
+    maxSpeed: 700,       // px / s hard cap
+    fireCooldown: 0.16,  // s between lasers
+    respawnDelay: 2.2,   // s before re-deployment
+    invulnerable: 2.6    // s of post-respawn immunity
+  },
+  laser: {
+    radius: 2.6,
+    life: 1.15,          // s
+    speed: 360           // muzzle speed (px / s) — single source of truth
+                         // shared by the ship and UFO lasers
+  },
+  ufo: {
+    radius: 22,         // broad-phase collision radius (px)
+    score: 200,         // bonus for destroying one
+    speed: 145,         // fixed horizontal cruise (px / s)
+    bobAmp: 22,         // sine-wave vertical amplitude (px)
+    bobFreq: 1.15,      // wave speed (rad / s)
+    fireInterval: 2.0,  // s between hostile shots (≈120 frames)
+    aimSpread: 0.12,    // rad of random aim error (±0.12 ≈ ±6.9°)
+    spawnEvery: 24,     // avg s between spawn attempts
+    maxConcurrent: 2    // cap simultaneous UFOs
+  },
+  ufoLaser: {
+    radius: 2.8,
+    life: 2.2           // s — long enough to cross the field
+  },
+  asteroid: {
+    3: { radius: 56, score: 20,  speedMin: 28,  speedMax: 85,  spin: 0.55 },
+    2: { radius: 31, score: 50,  speedMin: 70,  speedMax: 145, spin: 1.25 },
+    1: { radius: 16, score: 100, speedMin: 125, speedMax: 230, spin: 2.20 }
+  },
+  split: {
+    inherit: 1.14,       // child keeps ~114% of parent velocity
+    lateralMin: 55,      // perpendicular impulse (px / s)
+    lateralMax: 125
+  },
+  audio: {               // procedural synth tuning (see SoundEffects)
+    master: 0.5,                       // master output level (linear)
+    limiter: {                         // master-bus ceiling guard — holds
+      threshold: -3,                   // any sum that would clip at the
+      knee: 0,                         // ±1.0 output; transparent below
+      ratio: 20,                       // the threshold, so hand-tuned
+      attack: 0.002,                   // gains stay safe to push
+      release: 0.12
+    },
+    lead: 0.02,                        // schedule-ahead (s) — keeps envelopes
+                                       // ahead of the audio playhead so they
+                                       // are never crushed into clicks
+    spawn:  { from: 100,  to: 1200, dur: 0.40, gain: 0.35 },
+    laser: {
+      player: { type: "sawtooth", from: 800,  to: 100, dur: 0.15, gain: 0.25 },
+      ufo:    { type: "triangle", from: 1400, to: 400, dur: 0.12, gain: 0.22 }
+    },
+    thrust: { cutoff: 800, gain: 1.0, attack: 0.10, release: 0.06 },
+    siren:  { base: 750, depth: 100, rate: 4, gain: 0.14 },
+    explosion: {
+      "player":         { dur: 1.80, cutoff: 250,  gain: 0.90 },
+      "ufo":            { dur: 0.40, cutoff: 1200, gain: 0.50 },
+      "asteroid-large": { dur: 0.80, cutoff: 400,  gain: 1.70 },
+      "asteroid-small": { dur: 0.25, cutoff: 800,  gain: 1.55 }
+    },
+    heartbeat: { hi: 80, lo: 65, intervalMax: 1.2, intervalMin: 0.05,
+                 dur: 0.22, gain: 1.99 }   // triangle thump w/ 2×→1× pitch
+                                           // drop (see playHeartbeat) — the
+                                           // sweep + harmonics keep it
+                                           // audible on speakers that can't
+                                           // reproduce the 65–80 Hz tone
+  }
+});
+
+/* ================================================================
+ *  VECTOR2D — minimal 2-D vector algebra utility
+ * ================================================================ */
+class Vector2D {
+  constructor(x = 0, y = 0) {
+    this.x = x;
+    this.y = y;
+  }
+
+  clone() {
+    return new Vector2D(this.x, this.y);
+  }
+
+  add(v) {
+    this.x += v.x;
+    this.y += v.y;
+    return this;
+  }
+
+  sub(v) {
+    this.x -= v.x;
+    this.y -= v.y;
+    return this;
+  }
+
+  scale(s) {
+    this.x *= s;
+    this.y *= s;
+    return this;
+  }
+
+  magnitude() {
+    return Math.hypot(this.x, this.y);
+  }
+
+  magnitudeSq() {
+    return this.x * this.x + this.y * this.y;
+  }
+
+  normalize() {
+    const m = this.magnitude();
+    if (m > 1e-9) {
+      this.x /= m;
+      this.y /= m;
+    }
+    return this;
+  }
+
+  limit(max) {
+    const mSq = this.magnitudeSq();
+    if (mSq > max * max) {
+      this.scale(max / Math.sqrt(mSq));
+    }
+    return this;
+  }
+
+  angle() {
+    return Math.atan2(this.y, this.x);
+  }
+
+  distanceTo(v) {
+    return Math.hypot(this.x - v.x, this.y - v.y);
+  }
+
+  static fromAngle(a, len = 1) {
+    return new Vector2D(Math.cos(a) * len, Math.sin(a) * len);
+  }
+
+  static random(len = 1) {
+    return Vector2D.fromAngle(Math.random() * Math.PI * 2, len);
+  }
+}
+
+/* ================================================================
+ *  GEOMETRY — narrow-phase circle vs polygon collision
+ * ================================================================ */
+function pointInPolygon(px, py, pts) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i].x, yi = pts[i].y;
+    const xj = pts[j].x, yj = pts[j].y;
+    if ((yi > py) !== (yj > py) &&
+        px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function pointSegmentDistSq(px, py, ax, ay, bx, by) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx;
+  const cy = ay + t * dy;
+  const ex = px - cx;
+  const ey = py - cy;
+  return ex * ex + ey * ey;
+}
+
+function circlePolygonHit(cx, cy, r, pts) {
+  if (pointInPolygon(cx, cy, pts)) return true;
+  const rSq = r * r;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    if (pointSegmentDistSq(cx, cy, pts[j].x, pts[j].y, pts[i].x, pts[i].y) < rSq) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/*
+ * Swept narrow phase for fast projectiles: does the segment
+ * (ax,ay)→(bx,by) — i.e. the laser's travel this frame — strike the polygon,
+ * counting the laser's radius as clearance? Catches tunnelling that a single
+ * centre-to-centre point test misses (esp. across concave asteroid corners).
+ */
+function segPolygonHit(ax, ay, bx, by, r, pts) {
+  const rSq = r * r;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const px = pts[j].x, py = pts[j].y;
+    const qx = pts[i].x, qy = pts[i].y;
+    /* (a) Segment crosses the polygon edge. Parallel edges (denom === 0)
+       have no unique crossing point, so treat them as "no crossing" — the
+       proximity test (b) below still catches grazing passes. (The previous
+       `denom !== 0 && ...` form yielded `false`, which coerces to 0 and
+       silently passed the 0..1 range check: any laser travelling parallel
+       to an edge — or a degenerate zero-length segment — false-positived
+       against every polygon, consuming the laser and destroying a distant
+       asteroid.) */
+    const d1x = qx - px, d1y = qy - py;
+    const d2x = bx - ax, d2y = by - ay;
+    const denom = d1x * d2y - d1y * d2x;
+    const t = denom === 0 ? -1
+      : ((ax - px) * d2y - (ay - py) * d2x) / denom;
+    const u = denom === 0 ? -1
+      : ((ax - px) * d1y - (ay - py) * d1x) / denom;
+    if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return true;
+    /* (b) Closest point of the segment to the edge lies within the laser radius. */
+    if (pointSegmentDistSq(px, py, ax, ay, bx, by) < rSq) return true;
+    if (pointSegmentDistSq(qx, qy, ax, ay, bx, by) < rSq) return true;
+  }
+  return false;
+}
+
+/* ================================================================
+ *  ENTITY — base class: position, velocity, integrate, wrap
+ * ================================================================ */
+class Entity {
+  constructor(position, engine) {
+    this.position = position;
+    this.velocity = new Vector2D();
+    this.radius = 10;
+    this.alive = true;
+    this.engine = engine;
+  }
+
+  /* Advance position along velocity for dt seconds (state mutation only). */
+  integrate(dt) {
+    /* Note: advance position WITHOUT mutating velocity.
+       This used to be `this.position.add(this.velocity.scale(dt))`, but
+       Vector2D.scale() is destructive, so that permanently multiplied the
+       entity's velocity by dt every frame (ship stuck near 0, SPD readout 0). */
+    this.position.x += this.velocity.x * dt;
+    this.position.y += this.velocity.y * dt;
+    this.wrap(this.engine.width, this.engine.height);
+  }
+
+  /*
+   * Seamless screen wrap keyed to the entity's radial boundary:
+   * an entity re-enters the opposite edge exactly when its outer rim
+   * fully leaves the current one — no visual snapping.
+   */
+  wrap(w, h) {
+    const r = this.radius;
+    const p = this.position;
+    if (p.x + r < 0) p.x += w;
+    else if (p.x - r > w) p.x -= w;
+    if (p.y + r < 0) p.y += h;
+    else if (p.y - r > h) p.y -= h;
+  }
+}
+
+/* ================================================================
+ *  SHIP — inertia / friction flight model
+ * ================================================================ */
+class Ship extends Entity {
+  constructor(position, engine) {
+    super(position, engine);
+    this.radius = CONFIG.ship.radius;
+    this.angle = -Math.PI / 2;   // nose up
+    this.thrusting = false;
+    this.fireTimer = 0;
+    this.invulnTimer = 0;
+    this.respawnTimer = 0;
+    this.dead = false;
+    this.visible = true;
+  }
+
+  fire() {
+    if (this.dead || !this.visible || this.fireTimer > 0) return;
+    this.fireTimer = CONFIG.ship.fireCooldown;
+    const dir = Vector2D.fromAngle(this.angle);
+    /* Scale copies, not `dir` itself: Vector2D.scale() is destructive, and
+       chaining the muzzle-offset scale into the shot used to make the laser
+       fly at (radius + 6) × laserSpeed instead of laserSpeed. */
+    const muzzle = this.position.clone().add(dir.clone().scale(this.radius + 6));
+    /* Single source of truth: muzzle speed is CONFIG.laser.speed, shared with
+       the UFO laser, so future retuning is a one-line change. */
+    const vel = this.velocity.clone().add(dir.clone().scale(CONFIG.laser.speed));
+    this.engine.lasers.push(new Laser(muzzle, vel, this.engine));
+    this.engine.sfx.playLaser(false);
+  }
+
+  respawn() {
+    const { width: w, height: h } = this.engine;
+    let pos = new Vector2D(w / 2, h / 2);
+    for (let i = 0; i < 32; i++) {
+      const cand = new Vector2D(Math.random() * w, Math.random() * h);
+      let safe = true;
+      for (const a of this.engine.asteroids) {
+        if (cand.distanceTo(a.position) < a.radius + 150) { safe = false; break; }
+      }
+      if (safe) { pos = cand; break; }
+    }
+    this.position = pos;
+    this.velocity = new Vector2D();
+    this.angle = -Math.PI / 2;
+    this.dead = false;
+    this.visible = true;
+    this.invulnTimer = CONFIG.ship.invulnerable;
+    this.engine.particles.burst(pos, [160, 230, 255], 16, 18, 110, 0.3, 0.8);
+    this.engine.sfx.playSpawn();
+  }
+
+  update(dt) {
+    if (this.dead) {
+      if (this.respawnTimer > 0) {
+        this.respawnTimer -= dt;
+        if (this.respawnTimer <= 0) this.respawn();
+      }
+      return;
+    }
+
+    const k = this.engine.input;
+    if (k.left)  this.angle -= CONFIG.ship.rotateSpeed * dt;
+    if (k.right) this.angle += CONFIG.ship.rotateSpeed * dt;
+
+    this.thrusting = !!k.thrust;
+    if (this.thrusting) {
+      this.velocity.add(Vector2D.fromAngle(this.angle).scale(CONFIG.ship.thrust * dt));
+    }
+
+    /* Frame-rate independent friction: v(t+dt) = v(t) * e^(-drag*dt) */
+    this.velocity.scale(Math.exp(-CONFIG.ship.drag * dt));
+    this.velocity.limit(CONFIG.ship.maxSpeed);
+
+    if (this.fireTimer > 0) this.fireTimer -= dt;
+    if (this.invulnTimer > 0) this.invulnTimer -= dt;
+
+    this.integrate(dt);
+  }
+
+  render(ctx) {
+    if (this.dead || !this.visible) return;
+    /* Blink while invulnerable. */
+    if (this.invulnTimer > 0 && Math.floor(this.engine.time * 14) % 2 === 0) return;
+
+    ctx.save();
+    ctx.translate(this.position.x, this.position.y);
+    ctx.rotate(this.angle);
+    ctx.strokeStyle = "#e8f7ff";
+    ctx.lineWidth = 1.8;
+    ctx.shadowColor = "rgba(120, 216, 255, 0.85)";
+    ctx.shadowBlur = 12;
+
+    if (this.thrusting && Math.random() < 0.82) {
+      ctx.beginPath();
+      ctx.moveTo(-9, 4.6);
+      ctx.lineTo(-16 - Math.random() * 8, 0);
+      ctx.lineTo(-9, -4.6);
+      ctx.stroke();
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(16, 0);
+    ctx.lineTo(-10, 9);
+    ctx.lineTo(-6, 0);
+    ctx.lineTo(-10, -9);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ================================================================
+ *  ASTEROID — procedural jagged polygon + fission splitting
+ * ================================================================ */
+class Asteroid extends Entity {
+  constructor(position, size, engine, speedMul = 1) {
+    super(position, engine);
+    this.size = size; // 3 = large, 2 = medium, 1 = small
+    const spec = CONFIG.asteroid[size];
+    this.radius = spec.radius;
+    const speed = (spec.speedMin + Math.random() * (spec.speedMax - spec.speedMin)) * speedMul;
+    this.velocity = Vector2D.random(speed);
+    this.angle = Math.random() * Math.PI * 2;
+    this.spin = (Math.random() < 0.5 ? -1 : 1) *
+      spec.spin * (0.6 + Math.random() * 0.8);
+    this.shape = Asteroid.generateShape(this.radius, size);
+  }
+
+  /*
+   * Unique silhouette per instance: a ring of vertices at the ideal
+   * angle step, with randomized angular jitter and radial offsets
+   * (72% – 117% of nominal radius) producing a jagged outline.
+   */
+  static generateShape(radius, size) {
+    const vertices = 10 + (3 - size) * 2 + Math.floor(Math.random() * 5);
+    const pts = new Array(vertices);
+    const slice = (Math.PI * 2) / vertices;
+    for (let i = 0; i < vertices; i++) {
+      const a = i * slice + (Math.random() - 0.5) * slice * 0.7;
+      const r = radius * (0.72 + Math.random() * 0.45);
+      pts[i] = new Vector2D(Math.cos(a) * r, Math.sin(a) * r);
+    }
+    return pts;
+  }
+
+  /* World-space polygon (position + rotation applied) for narrow-phase tests. */
+  worldPoints() {
+    const cos = Math.cos(this.angle);
+    const sin = Math.sin(this.angle);
+    const pts = this.shape;
+    const out = new Array(pts.length);
+    for (let i = 0; i < pts.length; i++) {
+      out[i] = new Vector2D(
+        this.position.x + pts[i].x * cos - pts[i].y * sin,
+        this.position.y + pts[i].x * sin + pts[i].y * cos
+      );
+    }
+    return out;
+  }
+
+  update(dt) {
+    this.angle += this.spin * dt;
+    this.integrate(dt);
+  }
+
+  render(ctx) {
+    ctx.save();
+    ctx.translate(this.position.x, this.position.y);
+    ctx.rotate(this.angle);
+    ctx.beginPath();
+    const pts = this.shape;
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    /* Cheap glow: wide faint under-stroke + crisp top stroke. */
+    ctx.strokeStyle = "rgba(126, 222, 255, 0.10)";
+    ctx.lineWidth = 4.5;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(154, 228, 255, 0.95)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ================================================================
+ *  LASER — player projectile with lifetime
+ * ================================================================ */
+class Laser extends Entity {
+  constructor(position, velocity, engine) {
+    super(position, engine);
+    this.velocity = velocity;
+    this.radius = CONFIG.laser.radius;
+    this.life = CONFIG.laser.life;
+    this.prevPos = position.clone();
+  }
+
+  update(dt) {
+    this.life -= dt;
+    if (this.life <= 0) this.alive = false;
+    this.prevPos = this.position.clone();
+    this.integrate(dt);
+  }
+
+  render(ctx) {
+    const v = this.velocity.clone().normalize();
+    const tailX = this.position.x - v.x * 8;
+    const tailY = this.position.y - v.y * 8;
+    ctx.save();
+    ctx.strokeStyle = "#fff6cf";
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.shadowColor = "rgba(255, 212, 94, 0.9)";
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.moveTo(tailX, tailY);
+    ctx.lineTo(this.position.x, this.position.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ================================================================
+ *  UFO SHIP — hostile saucer: horizontal drift + sine bob,
+ *  fires targeted lasers, and exits (does not screen-wrap).
+ * ================================================================ */
+class UFOShip extends Entity {
+  constructor(engine) {
+    const { width: w, height: h } = engine;
+    const fromLeft = Math.random() < 0.5;
+    const y = engine.height * (0.16 + Math.random() * 0.68);
+    const x = fromLeft ? -40 : w + 40;
+    super(new Vector2D(x, y), engine);
+
+    this.radius = CONFIG.ufo.radius;
+    /* Fixed horizontal cruise, direction set by spawn side. */
+    this.velocity = new Vector2D((fromLeft ? 1 : -1) * CONFIG.ufo.speed, 0);
+    this.baseY = y;                    // centre line for the sine bob
+    this.phase = Math.random() * Math.PI * 2;
+    this.fireTimer = CONFIG.ufo.fireInterval * 0.5; // first shot a beat in
+    this.offscreen = false;
+    /* True once the saucer has flown fully inside the field. Spawns start
+       offscreen by design, so the exit cull must not fire until entry. */
+    this.hasEntered = false;
+    this.engine.sfx.startUFOSiren();
+  }
+
+  /* Hostile laser: aimed at the player (with random aim error), or a random
+     bearing when no live target. Muzzle speed comes from CONFIG.laser.speed,
+     the same constant the player laser uses. */
+  fire() {
+    const aimed = this.engine.ship && !this.engine.ship.dead;
+    let dir = aimed
+      ? this.engine.ship.position.clone().sub(this.position).normalize()
+      : Vector2D.random();
+    /* Dial down accuracy: rotate the aim line by a random angle within
+       ±CONFIG.ufo.aimSpread so shots spray around the target instead of
+       landing dead-centre. */
+    const jitter = (Math.random() * 2 - 1) * CONFIG.ufo.aimSpread;
+    dir = Vector2D.fromAngle(dir.angle() + jitter);
+    /* Muzzle offset scaled on a copy: Vector2D.scale() is destructive, so
+       scaling `dir` itself would multiply the offset into the shot speed. */
+    const muzzle = this.position.clone().add(dir.clone().scale(this.radius * 0.7));
+    const vel = dir.scale(CONFIG.laser.speed);
+    this.engine.ufoLasers.push(new UFOLaser(muzzle, vel, this.engine));
+    this.engine.sfx.playLaser(true);
+  }
+
+  update(dt) {
+    if (this.offscreen) return;
+    this.phase += CONFIG.ufo.bobFreq * dt;
+    this.position.x += this.velocity.x * dt;
+    /* Sinusoidal vertical wave around the cruise line. */
+    this.position.y = this.baseY +
+      Math.sin(this.phase) * CONFIG.ufo.bobAmp;
+
+    if (this.fireTimer > 0) this.fireTimer -= dt;
+    else {
+      this.fireTimer = CONFIG.ufo.fireInterval;
+      this.fire();
+    }
+
+    /* Remove once fully clear of the far boundary (no screen-wrap).
+       Guarded by `hasEntered`: the UFO spawns just offscreen on purpose,
+       so the cull only applies after it has cruised into view — otherwise
+       it would be destroyed on the very first update tick. */
+    const r = this.radius;
+    if (!this.hasEntered) {
+      if (this.position.x - r >= 0 &&
+          this.position.x + r <= this.engine.width) {
+        this.hasEntered = true;
+      }
+    } else if (this.position.x - r > this.engine.width ||
+               this.position.x + r < 0) {
+      this.alive = false;
+      this.offscreen = true;
+    }
+  }
+
+  render(ctx) {
+    ctx.save();
+    ctx.translate(this.position.x, this.position.y);
+    ctx.lineJoin = "round";
+
+    /* Classic vector saucer, matching the original game's silhouette:
+       a wide hull pointed at both ends (hexagonal lens), a small trapezoid
+       dome rising from the centre segment, and two vertical lines dividing
+       the hull into left / centre / right panels. */
+    const saucerPath = () => {
+      ctx.beginPath();
+      /* Hull: pointed tips at mid-height, flat top/bottom centre edges. */
+      ctx.moveTo(-20, 0);
+      ctx.lineTo(-7, -6);
+      ctx.lineTo(7, -6);
+      ctx.lineTo(20, 0);
+      ctx.lineTo(7, 6);
+      ctx.lineTo(-7, 6);
+      ctx.closePath();
+      /* Dome: small trapezoid on top of the centre segment. */
+      ctx.moveTo(-7, -6);
+      ctx.lineTo(-4, -11);
+      ctx.lineTo(4, -11);
+      ctx.lineTo(7, -6);
+      /* Hull dividers. */
+      ctx.moveTo(-4, -6);
+      ctx.lineTo(-4, 6);
+      ctx.moveTo(4, -6);
+      ctx.lineTo(4, 6);
+    };
+
+    /* Cheap glow: wide faint under-stroke + crisp top stroke. */
+    ctx.strokeStyle = "rgba(120, 255, 190, 0.12)";
+    ctx.lineWidth = 4.5;
+    saucerPath();
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(150, 255, 205, 0.95)";
+    ctx.lineWidth = 1.7;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ================================================================
+ *  UFO LASER — hostile projectile, distinct red styling
+ * ================================================================ */
+class UFOLaser extends Entity {
+  constructor(position, velocity, engine) {
+    super(position, engine);
+    this.velocity = velocity;
+    this.radius = CONFIG.ufoLaser.radius;
+    this.life = CONFIG.ufoLaser.life;
+    this.prevPos = position.clone();
+  }
+
+  update(dt) {
+    this.life -= dt;
+    if (this.life <= 0) this.alive = false;
+    this.prevPos = this.position.clone();
+    this.integrate(dt);
+  }
+
+  render(ctx) {
+    const v = this.velocity.clone().normalize();
+    const tailX = this.position.x - v.x * 15;   // longer, distinct
+    const tailY = this.position.y - v.y * 15;
+    ctx.save();
+    ctx.strokeStyle = "#ff5a5a";
+    ctx.lineWidth = 2.4;
+    ctx.lineCap = "round";
+    ctx.shadowColor = "rgba(255, 90, 90, 0.9)";
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(tailX, tailY);
+    ctx.lineTo(this.position.x, this.position.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ================================================================
+ *  PARTICLE SYSTEM — pooled streak particles with decay + fade
+ * ================================================================ */
+class ParticleSystem {
+  constructor() {
+    this.particles = [];
+  }
+
+  clear() {
+    this.particles.length = 0;
+  }
+
+  /*
+   * Spawn a radial burst: random velocities, randomized lifespans,
+   * per-particle RGB jitter around a base color, alpha tied to life.
+   */
+  burst(pos, rgb, count, speedMin, speedMax, lifeMin, lifeMax) {
+    for (let i = 0; i < count; i++) {
+      const life = lifeMin + Math.random() * (lifeMax - lifeMin);
+      const jitter = (base) =>
+        Math.max(0, Math.min(255, base + (Math.random() * 90 - 45)));
+      this.particles.push({
+        position: new Vector2D(
+          pos.x + (Math.random() - 0.5) * 8,
+          pos.y + (Math.random() - 0.5) * 8
+        ),
+        velocity: Vector2D.random(speedMin + Math.random() * (speedMax - speedMin)),
+        life: life,
+        maxLife: life,
+        r: jitter(rgb[0]),
+        g: jitter(rgb[1]),
+        b: jitter(rgb[2])
+      });
+    }
+  }
+
+  update(dt) {
+    const drag = Math.exp(-1.7 * dt);
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.life -= dt;
+      if (p.life <= 0) {
+        this.particles[i] = this.particles[this.particles.length - 1];
+        this.particles.pop();
+        continue;
+      }
+      /* Explicit increments: Vector2D.scale() is destructive, so chaining
+         p.position.add(p.velocity.scale(dt)) here used to multiply the
+         particle's velocity by dt every frame — drift nearly frozen. */
+      p.position.x += p.velocity.x * dt;
+      p.position.y += p.velocity.y * dt;
+      p.velocity.scale(drag);
+    }
+  }
+
+  render(ctx) {
+    if (this.particles.length === 0) return;
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = "round";
+    for (const p of this.particles) {
+      const a = Math.max(0, p.life / p.maxLife);
+      const tailX = p.velocity.x * 0.035;
+      const tailY = p.velocity.y * 0.035;
+      ctx.strokeStyle =
+        "rgba(" + (p.r | 0) + "," + (p.g | 0) + "," + (p.b | 0) + "," +
+        (a * 0.9).toFixed(3) + ")";
+      ctx.beginPath();
+      ctx.moveTo(p.position.x, p.position.y);
+      ctx.lineTo(p.position.x - tailX, p.position.y - tailY);
+      ctx.stroke();
+    }
+  }
+}
+
+/* ================================================================
+ *  ENGINE — game loop, state machine, world, HUD, rendering
+ * ================================================================ */
+class Engine {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.state = null;
+    this.time = 0;
+
+    this.input = { thrust: false, left: false, right: false, fire: false };
+
+    this.particles = new ParticleSystem();
+    this.asteroids = [];
+    this.lasers = [];
+    this.ufos = [];
+    this.ufoLasers = [];
+    this.ship = null;
+    this.stars = [];
+
+    this.score = 0;
+    this.highScore = 0;
+    this.newRecord = false;
+    this.lives = CONFIG.startLives;
+    this.wave = 0;
+    this.banner = "";
+    this.bannerTimer = 0;
+    this.interWaveTimer = 0;
+    this.ufoSpawnTimer = CONFIG.ufo.spawnEvery * (0.5 + Math.random() * 0.5);
+
+    this.lastTime = 0;
+
+    /* Procedural sound synthesis. The AudioContext is created lazily on
+       the first user gesture (autoplay policy); every method is a safe
+       no-op when audio is unavailable (test sandbox, old browsers). */
+    this.sfx = new SoundEffects();
+
+    /* Heartbeat state: cadence driven by the live asteroid count. */
+    this.heartbeatTimer = 0;
+    this.heartbeatToggle = false;
+    this.heartbeatMax = 0;
+
+    this.loadHighScore();
+    this.onResize();
+    this.bindInput();
+    this.setState(STATE.MENU);
+  }
+
+  /* ---------------- lifecycle ---------------- */
+
+  start() {
+    this.lastTime = performance.now();
+    const loop = (now) => {
+      requestAnimationFrame(loop);
+      let dt = (now - this.lastTime) / 1000;
+      this.lastTime = now;
+      if (dt > 0.05) dt = 0.05;   // clamp after tab-switch / hitches
+      if (dt < 0) dt = 0;
+      this.lastDt = dt;
+      this.time += dt;
+      this.update(dt);            // state mutation
+      this.render();              // drawing
+    };
+    requestAnimationFrame(loop);
+  }
+
+  /* ---------------- state machine ---------------- */
+
+  setState(next) {
+    this.state = next;
+
+    if (next === STATE.PLAYING) {
+      this.score = 0;
+      this.lives = CONFIG.startLives;
+      this.wave = 0;
+      this.asteroids = [];
+      this.lasers = [];
+      this.ufos = [];
+      this.ufoLasers = [];
+      this.ufoSpawnTimer = CONFIG.ufo.spawnEvery * (0.5 + Math.random() * 0.5);
+      this.particles.clear();
+      this.banner = "";
+      this.bannerTimer = 0;
+      this.interWaveTimer = 1.1;  // short beat before wave 1 spawns
+      this.heartbeatTimer = 0;
+      this.heartbeatToggle = false;
+      this.heartbeatMax = 0;
+      this.ship = new Ship(
+        new Vector2D(this.width / 2, this.height / 2),
+        this
+      );
+    } else if (next === STATE.MENU) {
+      this.seedAmbient();
+    } else if (next === STATE.GAME_OVER) {
+      this.newRecord = this.score > this.highScore;
+      if (this.newRecord) {
+        this.highScore = this.score;
+        try {
+          window.localStorage.setItem("neon-asteroids-highscore", String(this.highScore));
+        } catch (err) {
+          /* storage unavailable — high score stays in-memory */
+        }
+      }
+    }
+
+    /* Every state entry starts from silence; the continuous voices
+       re-engage from the per-frame polling loops (thrust) and the
+       per-frame siren sync while the new state runs. */
+    this.sfx.stopThrust();
+    this.sfx.stopUFOSiren();
+  }
+
+  startGame() {
+    this.setState(STATE.PLAYING);
+  }
+
+  /* ---------------- input ---------------- */
+
+  bindInput() {
+    const map = {
+      KeyW: "thrust", ArrowUp: "thrust",
+      KeyA: "left",   ArrowLeft: "left",
+      KeyD: "right",  ArrowRight: "right",
+      Space: "fire"
+    };
+
+    window.addEventListener("keydown", (e) => {
+      /* Any key press doubles as the autoplay-policy unlock gesture. */
+      this.sfx.unlock();
+
+      const isEnter = e.code === "Enter" || e.code === "NumpadEnter";
+
+      /* Menu / game-over entry points. */
+      if (!e.repeat &&
+          (isEnter || e.code === "Space") &&
+          (this.state === STATE.MENU || this.state === STATE.GAME_OVER)) {
+        e.preventDefault();
+        this.startGame();
+        return;
+      }
+      if (!e.repeat && e.code === "KeyR" && this.state === STATE.GAME_OVER) {
+        this.startGame();
+        return;
+      }
+
+      const action = map[e.code];
+      if (action) {
+        this.input[action] = true;
+        e.preventDefault();
+      }
+    });
+
+    window.addEventListener("keyup", (e) => {
+      const action = map[e.code];
+      if (action) this.input[action] = false;
+    });
+
+    window.addEventListener("blur", () => {
+      for (const k in this.input) this.input[k] = false;
+      this.sfx.stopThrust();
+    });
+  }
+
+  /* ---------------- layout / backdrop ---------------- */
+
+  onResize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.width = window.innerWidth;
+    this.height = window.innerHeight;
+    this.canvas.width = Math.floor(this.width * dpr);
+    this.canvas.height = Math.floor(this.height * dpr);
+    this.canvas.style.width = this.width + "px";
+    this.canvas.style.height = this.height + "px";
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    this.generateStars();
+
+    const g = this.ctx.createRadialGradient(
+      this.width / 2, this.height / 2, Math.min(this.width, this.height) * 0.35,
+      this.width / 2, this.height / 2, Math.max(this.width, this.height) * 0.72
+    );
+    g.addColorStop(0, "rgba(0,0,0,0)");
+    g.addColorStop(1, "rgba(0,0,0,0.5)");
+    this.vignette = g;
+  }
+
+  generateStars() {
+    const count = Math.max(60, Math.min(220,
+      Math.floor((this.width * this.height) / 9000)));
+    this.stars = [];
+    for (let i = 0; i < count; i++) {
+      this.stars.push({
+        x: Math.random() * this.width,
+        y: Math.random() * this.height,
+        s: Math.random() < 0.88 ? 1 : 2,
+        phase: Math.random() * Math.PI * 2,
+        speed: 0.5 + Math.random() * 1.6
+      });
+    }
+  }
+
+  seedAmbient() {
+    this.asteroids = [];
+    this.lasers = [];
+    this.ship = null;
+    for (let i = 0; i < 5; i++) {
+      const p = new Vector2D(Math.random() * this.width, Math.random() * this.height);
+      this.asteroids.push(new Asteroid(p, 3, this, 0.7));
+    }
+  }
+
+  loadHighScore() {
+    this.highScore = 0;
+    try {
+      const v = Number(window.localStorage.getItem("neon-asteroids-highscore"));
+      if (Number.isFinite(v) && v > 0) this.highScore = v;
+    } catch (err) {
+      /* storage unavailable — in-memory high score only */
+    }
+  }
+
+  /* ---------------- world rules ---------------- */
+
+  nextWave() {
+    this.wave += 1;
+    const count = Math.min(2 + this.wave, 9);
+    const speedMul = 1 + (this.wave - 1) * 0.07;
+    for (let i = 0; i < count; i++) {
+      let p;
+      for (let tries = 0; tries < 24; tries++) {
+        p = new Vector2D(Math.random() * this.width, Math.random() * this.height);
+        if (!this.ship ||
+            p.distanceTo(this.ship.position) > 240) break;
+      }
+      this.asteroids.push(new Asteroid(p, 3, this, speedMul));
+    }
+    this.banner = "WAVE " + String(this.wave).padStart(2, "0");
+    this.bannerTimer = 2.2;
+    this.heartbeatMax = count;   // heartbeat cadence baseline for this wave
+  }
+
+  /*
+   * Classic two-tone heartbeat: deep alternating thumps whose cadence is
+   * driven by the live asteroid count — a full field beats slowly
+   * (~1.2 s intervals) and accelerates linearly down to a rapid
+   * ~0.25 s pulse as rocks are vaporized. Silent while the field is
+   * empty (the inter-wave beat) and restarted fresh with each wave.
+   */
+  updateHeartbeat(dt) {
+    const n = this.asteroids.length;
+    if (n === 0) {
+      this.heartbeatTimer = 0;
+      this.heartbeatToggle = false;
+      return;
+    }
+    const cfg = CONFIG.audio.heartbeat;
+    const frac = Math.min(1, n / Math.max(1, this.heartbeatMax));
+    const interval = cfg.intervalMin +
+      (cfg.intervalMax - cfg.intervalMin) * frac;
+    this.heartbeatTimer -= dt;
+    if (this.heartbeatTimer <= 0) {
+      this.heartbeatTimer = interval;
+      this.heartbeatToggle = !this.heartbeatToggle;
+      this.sfx.playHeartbeat(this.heartbeatToggle);
+    }
+  }
+
+  /*
+   * Destructive fission: the hit asteroid is marked dead and, if its
+   * tier allows, exactly two children spawn at the impact point with
+   * the parent velocity (slightly boosted) plus equal and opposite
+   * lateral impulses. Small asteroids terminate.
+   */
+  destroyAsteroid(ast) {
+    ast.alive = false;
+    this.score += CONFIG.asteroid[ast.size].score;
+    this.sfx.playExplosion(ast.size > 1 ? "asteroid-large" : "asteroid-small");
+    this.particles.burst(
+      ast.position,
+      [140, 214, 255],
+      16 + ast.size * 7,
+      40 + ast.size * 20,
+      130 + ast.size * 55,
+      0.4,
+      1.15
+    );
+
+    if (ast.size > 1) {
+      const perp = new Vector2D(-ast.velocity.y, ast.velocity.x).normalize();
+      for (const side of [-1, 1]) {
+        const child = new Asteroid(ast.position.clone(), ast.size - 1, this);
+        const vel = ast.velocity.clone().scale(CONFIG.split.inherit);
+        vel.add(perp.scale(side * (CONFIG.split.lateralMin +
+          Math.random() * (CONFIG.split.lateralMax - CONFIG.split.lateralMin))));
+        const maxV = CONFIG.asteroid[child.size].speedMax * 1.7;
+        const m = vel.magnitude();
+        if (m > maxV) vel.scale(maxV / m);
+        child.velocity = vel;
+        this.asteroids.push(child);
+      }
+    }
+  }
+
+  destroyShip() {
+    const ship = this.ship;
+    ship.dead = true;
+    ship.visible = false;
+    this.sfx.playExplosion("player");
+    this.particles.burst(
+      ship.position,
+      [255, 178, 74],
+      54,
+      30,
+      340,
+      0.5,
+      1.5
+    );
+    this.lives -= 1;
+    if (this.lives <= 0) {
+      this.setState(STATE.GAME_OVER);
+    } else {
+      ship.respawnTimer = CONFIG.ship.respawnDelay;
+    }
+  }
+
+  /*
+   * UFO is destroyed: awards a bonus score and emits a debris burst.
+   */
+  destroyUFO(ufo) {
+    ufo.alive = false;
+    ufo.offscreen = true;
+    this.score += CONFIG.ufo.score;
+    this.sfx.playExplosion("ufo");
+    this.particles.burst(
+      ufo.position,
+      [130, 255, 190],
+      26,
+      40,
+      240,
+      0.4,
+      1.2
+    );
+  }
+
+  /*
+   * Collision matrix:
+   *  1. broad phase — circle-vs-circle distance test
+   *  2. narrow phase — circle-vs-polygon (edge distance / ray cast)
+   * Applied to every active laser × asteroid pair and ship × asteroid.
+   */
+  resolveCollisions() {
+    /* lasers vs asteroids */
+    for (const laser of this.lasers) {
+      if (!laser.alive) continue;
+      for (const ast of this.asteroids) {
+        if (!ast.alive) continue;
+        /* Swept test over the laser's travel this frame: catches tunneling
+           and concave-corner passes that a centre-to-centre point test misses. */
+        if (segPolygonHit(laser.prevPos.x, laser.prevPos.y,
+                          laser.position.x, laser.position.y,
+                          laser.radius, ast.worldPoints())) {
+          laser.alive = false;
+          this.particles.burst(laser.position, [255, 240, 200],
+                               8, 40, 170, 0.15, 0.4);
+          this.destroyAsteroid(ast);
+          break;
+        }
+      }
+    }
+
+    /* ship vs asteroids */
+    const ship = this.ship;
+    if (ship && ship.visible && !ship.dead && ship.invulnTimer <= 0) {
+      for (const ast of this.asteroids) {
+        if (!ast.alive) continue;
+        const reach = ship.radius + ast.radius;
+        if (ship.position.distanceTo(ast.position) > reach) continue;
+        if (circlePolygonHit(ship.position.x, ship.position.y,
+                             ship.radius * 0.85, ast.worldPoints())) {
+          this.destroyShip();
+          break;
+        }
+      }
+    }
+
+    /* player lasers vs UFOs (bonus score on hit) */
+    for (const laser of this.lasers) {
+      if (!laser.alive) continue;
+      for (const ufo of this.ufos) {
+        if (!ufo.alive || ufo.offscreen) continue;
+        if (laser.position.distanceTo(ufo.position) <= laser.radius + ufo.radius) {
+          laser.alive = false;
+          this.particles.burst(laser.position, [130, 255, 190],
+                               8, 40, 170, 0.15, 0.4);
+          this.destroyUFO(ufo);
+          break;
+        }
+      }
+    }
+
+    /* UFO lasers vs player ship (costs a life) */
+    if (ship && ship.visible && !ship.dead && ship.invulnTimer <= 0) {
+      for (const ulaser of this.ufoLasers) {
+        if (!ulaser.alive) continue;
+        if (ulaser.position.distanceTo(ship.position) <= ulaser.radius + ship.radius) {
+          ulaser.alive = false;
+          this.destroyShip();
+          break;
+        }
+      }
+    }
+
+    /* asteroids vs UFOs: the collision destroys the UFO
+       (small asteroids that strike a UFO are shattered) */
+    for (const ufo of this.ufos) {
+      if (!ufo.alive || ufo.offscreen) continue;
+      for (const ast of this.asteroids) {
+        if (!ast.alive) continue;
+        const reach = ufo.radius + ast.radius;
+        if (ufo.position.distanceTo(ast.position) > reach) continue;
+        this.destroyUFO(ufo);
+        this.destroyAsteroid(ast);
+        break;
+      }
+    }
+  }
+  /* ---------------- update (state mutation only) ---------------- */
+
+  update(dt) {
+    this.particles.update(dt);
+
+    switch (this.state) {
+      case STATE.MENU:
+      case STATE.GAME_OVER:
+        /* Keep debris drifting behind the overlay for atmosphere. */
+        for (const ast of this.asteroids) ast.update(dt);
+        break;
+
+      case STATE.PLAYING:
+        if (this.bannerTimer > 0) this.bannerTimer -= dt;
+        if (this.input.fire) this.ship.fire();
+
+        this.ship.update(dt);
+
+        /* Thruster voice polls the thrust binding each frame: held key
+           fades the hum in, release (or death / hidden ship) fades out. */
+        if (this.input.thrust && this.ship &&
+            !this.ship.dead && this.ship.visible) {
+          this.sfx.startThrust();
+        } else {
+          this.sfx.stopThrust();
+        }
+
+        for (const laser of this.lasers) laser.update(dt);
+        for (const ast of this.asteroids) ast.update(dt);
+
+        /* Random UFO spawn: a timed attempt every ~24s, capped at 2. */
+        this.ufoSpawnTimer -= dt;
+        if (this.ufoSpawnTimer <= 0) {
+          this.ufoSpawnTimer = CONFIG.ufo.spawnEvery *
+            (0.75 + Math.random() * 0.5);
+          const active = this.ufos.filter((u) => !u.offscreen).length;
+          if (active < CONFIG.ufo.maxConcurrent) {
+            this.ufos.push(new UFOShip(this));
+          }
+        }
+
+        for (const ufo of this.ufos) ufo.update(dt);
+        for (const ulaser of this.ufoLasers) ulaser.update(dt);
+
+        this.resolveCollisions();
+
+        this.lasers = this.lasers.filter((l) => l.alive);
+        this.ufos = this.ufos.filter((u) => u.alive);
+        this.ufoLasers = this.ufoLasers.filter((l) => l.alive);
+        this.asteroids = this.asteroids.filter((a) => a.alive);
+
+        /* If the state flipped mid-frame — the ship's final death calls
+           setState from inside resolveCollisions, which silences every
+           voice — stop here: the syncs below would otherwise resurrect
+           the UFO siren on the game-over screen, and the heartbeat /
+           wave progression would keep simulating a PLAYING frame that
+           no longer exists. */
+        if (this.state !== STATE.PLAYING) break;
+
+        /* Siren tracks live UFO presence (both calls are idempotent). */
+        if (this.ufos.length > 0) this.sfx.startUFOSiren();
+        else this.sfx.stopUFOSiren();
+
+        /* Wave progression: clear the field → short beat → next wave. */
+        if (this.asteroids.length === 0) {
+          this.interWaveTimer -= dt;
+          if (this.interWaveTimer <= 0) this.nextWave();
+        } else {
+          this.interWaveTimer = 1.4;
+        }
+
+        /* Accelerating two-tone heartbeat keyed to the live asteroid count. */
+        this.updateHeartbeat(dt);
+        break;
+    }
+  }
+
+  /* ---------------- render (drawing only) ---------------- */
+
+  render() {
+    const ctx = this.ctx;
+    const { width: w, height: h } = this;
+
+    ctx.fillStyle = "#04060c";
+    ctx.fillRect(0, 0, w, h);
+    this.renderStars(ctx);
+
+    for (const ast of this.asteroids) ast.render(ctx);
+    for (const laser of this.lasers) laser.render(ctx);
+    for (const ufo of this.ufos) ufo.render(ctx);
+    for (const ulaser of this.ufoLasers) ulaser.render(ctx);
+    this.particles.render(ctx);
+    if (this.ship && this.state === STATE.PLAYING) this.ship.render(ctx);
+
+    ctx.fillStyle = this.vignette;
+    ctx.fillRect(0, 0, w, h);
+
+    if (this.state === STATE.PLAYING) {
+      this.renderHUD(ctx);
+      if (this.bannerTimer > 0) this.renderBanner(ctx);
+    } else if (this.state === STATE.MENU) {
+      this.renderMenu(ctx);
+    } else if (this.state === STATE.GAME_OVER) {
+      this.renderGameOver(ctx);
+    }
+  }
+
+  renderStars(ctx) {
+    for (const st of this.stars) {
+      const a = 0.18 + 0.5 * (0.5 + 0.5 * Math.sin(this.time * st.speed + st.phase));
+      ctx.fillStyle = "rgba(186, 224, 255," + a.toFixed(3) + ")";
+      ctx.fillRect(st.x, st.y, st.s, st.s);
+    }
+  }
+
+  drawShipIcon(ctx, x, y) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.strokeStyle = "rgba(160, 220, 255, 0.9)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(0, -9);
+    ctx.lineTo(7, 7);
+    ctx.lineTo(0, 4);
+    ctx.lineTo(-7, 7);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  renderHUD(ctx) {
+    const { width: w, height: h } = this;
+    ctx.save();
+    ctx.font = "700 15px ui-monospace, 'Courier New', monospace";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "rgba(178, 226, 255, 0.92)";
+
+    ctx.textAlign = "left";
+    ctx.fillText("SCORE  " + String(this.score).padStart(6, "0"), 22, 18);
+
+    ctx.fillText(
+      "UFO  ACTIVE " + this.ufos.length +
+      "  NEXT " + Math.max(0, this.ufoSpawnTimer).toFixed(1) + "s",
+      22, 40
+    );
+
+    ctx.textAlign = "right";
+    ctx.fillText("HI  " + String(this.highScore).padStart(6, "0"), w - 22, 18);
+
+    ctx.textAlign = "center";
+    ctx.fillText("WAVE  " + String(this.wave).padStart(2, "0"), w / 2, 18);
+
+    for (let i = 0; i < this.lives; i++) {
+      this.drawShipIcon(ctx, 30 + i * 28, h - 26);
+    }
+
+    /* UFO status: one saucer icon per active UFO, neon-green to match the sprite. */
+    for (let i = 0; i < this.ufos.length; i++) {
+      this.drawUfoIcon(ctx, w - 36 - i * 34, h - 26);
+    }
+    ctx.restore();
+  }
+
+  /* Tiny saucer glyph used by the UFO HUD status row — the same classic
+     silhouette as the in-game UFO, drawn at 0.45× scale. */
+  drawUfoIcon(ctx, x, y) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(0.45, 0.45);
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "rgba(150, 255, 205, 0.95)";
+    ctx.lineWidth = 1.7 / 0.45;   // counteract the scale so strokes stay crisp
+    ctx.beginPath();
+    ctx.moveTo(-20, 0);
+    ctx.lineTo(-7, -6);
+    ctx.lineTo(7, -6);
+    ctx.lineTo(20, 0);
+    ctx.lineTo(7, 6);
+    ctx.lineTo(-7, 6);
+    ctx.closePath();
+    ctx.moveTo(-7, -6);
+    ctx.lineTo(-4, -11);
+    ctx.lineTo(4, -11);
+    ctx.lineTo(7, -6);
+    ctx.moveTo(-4, -6);
+    ctx.lineTo(-4, 6);
+    ctx.moveTo(4, -6);
+    ctx.lineTo(4, 6);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  renderBanner(ctx) {
+    const { width: w, height: h } = this;
+    const alpha = Math.max(0, Math.min(1, this.bannerTimer / 0.7));
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = "700 30px ui-monospace, 'Courier New', monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#d6f2ff";
+    ctx.shadowColor = "rgba(110, 216, 255, 0.8)";
+    ctx.shadowBlur = 16;
+    ctx.fillText(this.banner, w / 2, h * 0.3);
+    ctx.restore();
+  }
+
+  renderMenu(ctx) {
+    const { width: w, height: h } = this;
+    ctx.save();
+    ctx.fillStyle = "rgba(3, 5, 10, 0.58)";
+    ctx.fillRect(0, 0, w, h);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    ctx.font = "700 52px ui-monospace, 'Courier New', monospace";
+    ctx.fillStyle = "#e6f7ff";
+    ctx.shadowColor = "rgba(110, 216, 255, 0.9)";
+    ctx.shadowBlur = 22;
+    ctx.fillText("A S T E R O I D S", w / 2, h * 0.26);
+    ctx.shadowBlur = 0;
+
+    ctx.font = "400 13px ui-monospace, 'Courier New', monospace";
+    ctx.fillStyle = "rgba(148, 205, 240, 0.85)";
+    ctx.fillText("NEON WIREFRAME  ·  ZERO DEPENDENCIES  ·  100% OFFLINE", w / 2, h * 0.26 + 42);
+
+    if (Math.floor(this.time * 2.2) % 2 === 0) {
+      ctx.font = "700 17px ui-monospace, 'Courier New', monospace";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText("PRESS  ENTER  TO  LAUNCH", w / 2, h * 0.52);
+    }
+
+    ctx.font = "400 14px ui-monospace, 'Courier New', monospace";
+    ctx.fillStyle = "rgba(148, 205, 240, 0.9)";
+    ctx.fillText("W / ↑  —  THRUST        A / D  ·  ← / →  —  ROTATE", w / 2, h * 0.615);
+    ctx.fillText("SPACE  —  FIRE           ENTER  —  START / RESTART", w / 2, h * 0.615 + 22);
+
+    ctx.font = "700 14px ui-monospace, 'Courier New', monospace";
+    ctx.fillStyle = "rgba(178, 226, 255, 0.92)";
+    ctx.fillText("HI-SCORE  " + String(this.highScore).padStart(6, "0"), w / 2, h * 0.72);
+
+    ctx.restore();
+  }
+
+  renderGameOver(ctx) {
+    const { width: w, height: h } = this;
+    ctx.save();
+    ctx.fillStyle = "rgba(3, 5, 10, 0.62)";
+    ctx.fillRect(0, 0, w, h);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    ctx.font = "700 52px ui-monospace, 'Courier New', monospace";
+    ctx.fillStyle = "#ffe3e3";
+    ctx.shadowColor = "rgba(255, 110, 90, 0.8)";
+    ctx.shadowBlur = 20;
+    ctx.fillText("G A M E   O V E R", w / 2, h * 0.30);
+    ctx.shadowBlur = 0;
+
+    ctx.font = "700 18px ui-monospace, 'Courier New', monospace";
+    ctx.fillStyle = "rgba(178, 226, 255, 0.95)";
+    ctx.fillText("FINAL SCORE  " + String(this.score).padStart(6, "0"), w / 2, h * 0.44);
+
+    ctx.font = "700 15px ui-monospace, 'Courier New', monospace";
+    ctx.fillStyle = "rgba(148, 205, 240, 0.9)";
+    const bestLine = "BEST  " + String(this.highScore).padStart(6, "0") +
+      (this.newRecord ? "   ★  NEW RECORD" : "");
+    ctx.fillText(bestLine, w / 2, h * 0.44 + 30);
+
+    if (Math.floor(this.time * 2.2) % 2 === 0) {
+      ctx.font = "700 17px ui-monospace, 'Courier New', monospace";
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText("PRESS  ENTER  TO  RESTART", w / 2, h * 0.62);
+    }
+
+    ctx.restore();
+  }
+}
+
+/* ================================================================
+ *  SOUND EFFECTS — procedural 8-bit-style synth, Web Audio API.
+ *
+ *  Zero audio assets: every voice is built live from oscillators,
+ *  a white-noise AudioBuffer, biquad filters and gain envelopes.
+ *  The AudioContext is created lazily on the first user gesture
+ *  (browser autoplay policy) and every entry point is a safe no-op
+ *  when audio is unavailable (test sandbox, old browsers).
+ *  Explosion noise comes from a private LCG — deliberately NOT
+ *  Math.random() — so the seeded gameplay RNG stream that the test
+ *  harness replays is never consumed by audio code.
+ * ================================================================ */
+class SoundEffects {
+  constructor() {
+    this.ctx = null;       // AudioContext — created on first use
+    this.master = null;    // master gain feeding the limiter
+    this.limiter = null;   // DynamicsCompressor ceiling guard on the bus
+    this.thrust = null;    // persistent { src, gain, active } thrust noise voice
+    this.siren = null;     // persistent { osc, lfo, gain } siren voice
+    this.noiseSeed = 1;    // private LCG state for explosion noise
+  }
+
+  /* Create/resume the context from a user-gesture handler (autoplay). */
+  unlock() {
+    this._ensure();
+    if (this.ctx && this.ctx.state === "suspended") {
+      try { this.ctx.resume(); } catch (err) { /* audio unavailable */ }
+    }
+  }
+
+  /* Lazily build context + master gain + limiter; null when unsupported. */
+  _ensure() {
+    if (this.ctx) return this.ctx;
+    try {
+      const AC = typeof AudioContext !== "undefined" ? AudioContext
+        : typeof webkitAudioContext !== "undefined" ? webkitAudioContext
+        : null;
+      if (!AC) return null;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.setValueAtTime(
+        CONFIG.audio.master, this.ctx.currentTime);
+      /* Master-bus limiter (the ceiling guard): per-voice gains are
+         hand-tuned by ear — low frequencies need large amplitudes to
+         perceive as loud — and overlapping voices can sum past the
+         digital ±1.0 ceiling. This node transparently holds such peaks
+         at the threshold instead of hard-clipping them into crackle. */
+      this.limiter = this.ctx.createDynamicsCompressor();
+      const lim = CONFIG.audio.limiter;
+      this.limiter.threshold.value = lim.threshold;
+      this.limiter.knee.value = lim.knee;
+      this.limiter.ratio.value = lim.ratio;
+      this.limiter.attack.value = lim.attack;
+      this.limiter.release.value = lim.release;
+      this.master.connect(this.limiter);
+      this.limiter.connect(this.ctx.destination);
+    } catch (err) {
+      this.ctx = null;   // any failure → permanently silent, game continues
+    }
+    return this.ctx;
+  }
+
+  /* Short-lived oscillator voice: pitch sweep + soft attack + decay env. */
+  _sweep(type, from, to, dur, gain) {
+    const ctx = this._ensure();
+    if (!ctx) return;
+    try {
+      /* Schedule slightly AHEAD of the playhead: zero-lead events can land
+         behind the audio thread and get their envelopes crushed into
+         full-volume steps, which are heard as clicks / a machine-gun buzz. */
+      const t = ctx.currentTime + CONFIG.audio.lead;
+      const osc = ctx.createOscillator();
+      const env = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(from, t);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(1, to), t + dur);
+      /* Linear attack from true zero. An exponential attack bunches its
+         rise into the final millisecond, which reads as a sharp click. */
+      env.gain.setValueAtTime(0, t);
+      env.gain.linearRampToValueAtTime(gain, t + 0.012);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      osc.connect(env);
+      env.connect(this.master);
+      osc.start(t);
+      osc.stop(t + dur + 0.05);
+    } catch (err) { /* never let audio break gameplay */ }
+  }
+
+  /* Spawn: rapid ascending sine sweep — the ship materializes. */
+  playSpawn() {
+    const s = CONFIG.audio.spawn;
+    this._sweep("sine", s.from, s.to, s.dur, s.gain);
+  }
+
+  /* Laser fire: player sawtooth plunge vs. UFO's higher triangle. */
+  playLaser(isUFO) {
+    const s = isUFO ? CONFIG.audio.laser.ufo : CONFIG.audio.laser.player;
+    this._sweep(s.type, s.from, s.to, s.dur, s.gain);
+  }
+
+  /* Heartbeat thump, kick-voiced so it survives small speakers: a pure
+     65–80 Hz sine sits below what most of them can reproduce at all (the
+     old "buzz" was really the click artifact — the only part of the thump
+     those speakers could play). Triangle adds gentle harmonics in the
+     audible band, and the 2×→1× pitch drop sweeps through mid-bass on
+     the way down to the two-tone identity pitch. */
+  playHeartbeat(high) {
+    const s = CONFIG.audio.heartbeat;
+    const f = high ? s.hi : s.lo;
+    this._sweep("triangle", f * 2, f, s.dur, s.gain);
+  }
+
+  /* ---- continuous voices: persistent, gain-gated, never restarted ---- */
+
+  /* Continuous thruster: a looped white-noise buffer through a lowpass
+     filter — the same shaped-noise recipe as the explosions, but looping
+     and gated by a GainNode. No tonal oscillator, so there is no harmonic
+     stack to read as "buzz". The source runs for the whole session;
+     ramps are scheduled only on STATE TRANSITIONS (guarded by `active`) —
+     re-anchoring the ramp every frame would churn the audio graph 60×/s
+     for no audible benefit. */
+  startThrust() {
+    const ctx = this._ensure();
+    if (!ctx) return;
+    try {
+      const t = ctx.currentTime;
+      const cfg = CONFIG.audio.thrust;
+      if (!this.thrust) {
+        /* One second of LCG white noise, generated once and looped — a
+           noise loop has no audible seam, and the private LCG keeps the
+           seeded gameplay RNG stream untouched. */
+        const rate = ctx.sampleRate || 44100;
+        const len = Math.max(1, Math.floor(rate));
+        const buf = ctx.createBuffer(1, len, rate);
+        const data = buf.getChannelData(0);
+        let s = this.noiseSeed | 0 || 1;
+        for (let i = 0; i < len; i++) {
+          s = (Math.imul(s, 1664525) + 1013904223) | 0;
+          data[i] = ((s >>> 0) / 4294967296) * 2 - 1;
+        }
+        this.noiseSeed = s;
+
+        const src = ctx.createBufferSource();
+        const filter = ctx.createBiquadFilter();
+        const gain = ctx.createGain();
+        src.buffer = buf;
+        src.loop = true;
+        filter.type = "lowpass";
+        filter.frequency.setValueAtTime(cfg.cutoff, t);
+        gain.gain.setValueAtTime(0, t);
+        src.connect(filter);
+        filter.connect(gain);
+        gain.connect(this.master);
+        src.start(t);
+        this.thrust = { src, gain, active: false };
+      }
+      if (this.thrust.active) return;    // already fading in / sustained
+      const g = this.thrust.gain.gain;
+      g.cancelScheduledValues(t);
+      g.setValueAtTime(g.value, t);
+      g.linearRampToValueAtTime(cfg.gain, t + cfg.attack);
+      this.thrust.active = true;
+    } catch (err) { /* ignore */ }
+  }
+
+  stopThrust() {
+    if (!this.ctx || !this.thrust || !this.thrust.active) return;
+    try {
+      const t = this.ctx.currentTime;
+      const g = this.thrust.gain.gain;
+      g.cancelScheduledValues(t);
+      g.setValueAtTime(g.value, t);
+      g.linearRampToValueAtTime(0, t + CONFIG.audio.thrust.release);
+      this.thrust.active = false;
+    } catch (err) { /* ignore */ }
+  }
+
+  /* UFO siren: sine carrier warbled between 650–850 Hz by a square LFO
+     wired straight into the carrier's frequency AudioParam — loops
+     cleanly for as long as a UFO is active. */
+  startUFOSiren() {
+    const ctx = this._ensure();
+    if (!ctx || this.siren) return;   // idempotent while a UFO is active
+    try {
+      const t = ctx.currentTime;
+      const cfg = CONFIG.audio.siren;
+      const osc = ctx.createOscillator();    // carrier
+      const lfo = ctx.createOscillator();    // warble modulator
+      const depth = ctx.createGain();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(cfg.base, t);
+      lfo.type = "square";
+      lfo.frequency.setValueAtTime(cfg.rate, t);
+      depth.gain.setValueAtTime(cfg.depth, t);
+      gain.gain.setValueAtTime(0, t);
+      lfo.connect(depth);
+      depth.connect(osc.frequency);          // ±depth around base → 650–850 Hz
+      osc.connect(gain);
+      gain.connect(this.master);
+      gain.gain.linearRampToValueAtTime(cfg.gain, t + 0.1);
+      lfo.start(t);
+      osc.start(t);
+      this.siren = { osc, lfo, gain };
+    } catch (err) { /* ignore */ }
+  }
+
+  stopUFOSiren() {
+    if (!this.ctx || !this.siren) return;
+    try {
+      const t = this.ctx.currentTime;
+      const s = this.siren;
+      this.siren = null;
+      s.gain.gain.cancelScheduledValues(t);
+      s.gain.gain.setValueAtTime(s.gain.gain.value, t);
+      s.gain.gain.linearRampToValueAtTime(0, t + 0.05);
+      s.osc.stop(t + 0.08);
+      s.lfo.stop(t + 0.08);
+    } catch (err) { /* ignore */ }
+  }
+
+  /* Explosions: pure white noise written into an AudioBuffer at trigger
+     time, lowpass-filtered and decay-enveloped. Four explicit variants
+     come from duration + cutoff configs in CONFIG.audio.explosion. */
+  playExplosion(type) {
+    const ctx = this._ensure();
+    const cfg = CONFIG.audio.explosion[type];
+    if (!ctx || !cfg) return;
+    try {
+      const rate = ctx.sampleRate || 44100;
+      const len = Math.max(1, Math.floor(rate * cfg.dur));
+      const buf = ctx.createBuffer(1, len, rate);
+      const data = buf.getChannelData(0);
+      /* Private LCG noise stream (Numerical Recipes constants):
+         deterministic per session and fully independent of the seeded
+         Math.random stream the test harness replays. */
+      let s = this.noiseSeed | 0 || 1;
+      for (let i = 0; i < len; i++) {
+        s = (Math.imul(s, 1664525) + 1013904223) | 0;
+        data[i] = ((s >>> 0) / 4294967296) * 2 - 1;   // uniform −1..1
+      }
+      this.noiseSeed = s;
+
+      const t = ctx.currentTime + CONFIG.audio.lead;
+      const src = ctx.createBufferSource();
+      const filter = ctx.createBiquadFilter();
+      const env = ctx.createGain();
+      src.buffer = buf;
+      filter.type = "lowpass";
+      filter.frequency.setValueAtTime(cfg.cutoff, t);
+      /* Soft linear onset — slamming the noise in at full level reads as a
+         click, and rapid destruction bursts then stack into a buzz. */
+      env.gain.setValueAtTime(0, t);
+      env.gain.linearRampToValueAtTime(cfg.gain, t + 0.008);
+      env.gain.exponentialRampToValueAtTime(0.0001, t + cfg.dur);
+      src.connect(filter);
+      filter.connect(env);
+      env.connect(this.master);
+      src.start(t);    // one-shot: plays the buffer once, then frees
+    } catch (err) { /* ignore */ }
+  }
+}
+
+/* ================================================================
+ *  BOOTSTRAP
+ * ================================================================ */
+const engine = new Engine(document.getElementById("game"));
+window.addEventListener("resize", () => engine.onResize());
+engine.start();
+
+/* ================================================================
+ *  TEST EXPORT — inert in the browser
+ *  The Node test harness (test/harness.js) defines
+ *  globalThis.__ASTEROIDS_TEST__ as a function before evaluating
+ *  this file, so the live engine and shared tables are handed to it
+ *  and tests can drive the game directly. When played normally in a
+ *  browser the guard is undefined and this never runs.
+ * ================================================================ */
+if (typeof globalThis !== "undefined" &&
+    typeof globalThis.__ASTEROIDS_TEST__ === "function") {
+  globalThis.__ASTEROIDS_TEST__({ engine, CONFIG, STATE });
+}
+
+})();
+</script>
+</body>
+</html>
